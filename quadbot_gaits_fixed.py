@@ -1,20 +1,5 @@
-#!/usr/bin/env python3
-"""
-Teleoperation script for quadruped robot
-Use arrow keys to control robot movement:
-- UP: Move forward
-- DOWN: Move backward
-- LEFT: Turn left
-- RIGHT: Turn right
-- SPACE: Stop
-- ESC or 'q': Quit
-"""
-
 from __future__ import division
 import time
-import sys
-import tty
-import termios
 import RPi.GPIO as GPIO
 from threading import Thread, Lock
 from adafruit_servokit import ServoKit
@@ -43,8 +28,9 @@ GPIO.setup(leg4_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 # Initialize ServoKit for 16 channels
 kit = ServoKit(channels=16)
 
-# Set actuation range for all servos (0-180 degrees) - done lazily
-# We'll set this in begin() to avoid freezing on startup
+# Set actuation range for all servos (0-180 degrees)
+for i in range(16):
+    kit.servo[i].actuation_range = 180
 
 # FIXED: Increased delays to prevent Pi freeze
 move_delay = 0.01  # Changed from 0.0005 to 0.01 (10ms)
@@ -79,120 +65,41 @@ leg3_footdown = footdown
 leg4_footdown = footdown
 
 leg_formation = 0
-servos_configured = False
 
 channel_cur = [90,90,90,90,90,90,90,90,90,90,90,90]
 
-def getch():
-    """Get a single character from stdin without echo"""
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(sys.stdin.fileno())
-        ch = sys.stdin.read(1)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return ch
-
-def print_controls():
-    """Print control instructions"""
-    print("\n" + "="*50)
-    print("QUADRUPED TELEOPERATION CONTROLS")
-    print("="*50)
-    print("  ↑ (UP)    : Move Forward")
-    print("  ↓ (DOWN)  : Move Backward")
-    print("  ← (LEFT)  : Turn Left")
-    print("  → (RIGHT) : Turn Right")
-    print("  SPACE     : Stop/Rest position")
-    print("  ESC or q  : Quit")
-    print("="*50)
-    print("\nInitializing robot...\n")
 
 def main():
-    global leg_formation
-    
-    print_controls()
     begin()
-    print("Robot ready! Use arrow keys to control.\n")
-    
-    try:
-        while True:
-            key = getch()
-            
-            # Check for arrow keys (escape sequences)
-            if key == '\x1b':  # ESC sequence
-                next1 = getch()
-                if next1 == '[':  # Arrow key sequence
-                    next2 = getch()
-                    if next2 == 'A':  # UP arrow
-                        print("→ Moving Forward")
-                        forward()
-                    elif next2 == 'B':  # DOWN arrow
-                        print("→ Moving Backward")
-                        backward()
-                    elif next2 == 'D':  # LEFT arrow
-                        print("→ Turning Left")
-                        turn_left()
-                    elif next2 == 'C':  # RIGHT arrow
-                        print("→ Turning Right")
-                        turn_right()
-                else:  # ESC key alone
-                    print("\nExiting...")
-                    break
-            
-            elif key == ' ':  # SPACE - return to rest position
-                print("→ Stopping - Rest position")
-                begin()
-            
-            elif key == 'q' or key == 'Q':  # Quit
-                print("\nExiting...")
-                break
-            
-            elif key == '\x03':  # Ctrl+C
-                print("\nInterrupted by user")
-                break
-    
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    
-    finally:
-        print("Shutting down robot...")
-        # Return to neutral position
-        for i in range(12):
-            channel_cur[i] = 90
-        GPIO.cleanup()
-        print("Goodbye!")
+    time.sleep(1)
+
+    turn_right()
+    turn_right()
+    turn_right()
+    turn_right()
+
+    # for x in range(0,5):
+    #     forward()
+
+    # for x in range(0,15):
+    # for x in range(0,15):
+    #     turn_left()
     
 
 def begin():
-    global leg_formation, servos_configured
-    
-    # Set actuation range for servos (only once)
-    if not servos_configured:
-        print("Configuring servos...")
-        for i in range(12):  # Only configure servos we use (0-11)
-            kit.servo[i].actuation_range = 180
-            time.sleep(0.05)  # Delay between each servo config
-        servos_configured = True
-    
-    print("Moving to initial position...")
-    # Move legs one at a time to avoid I2C bus overload
-    leg1(89,89,89)
-    time.sleep(0.2)
+    #Move Left Side
+    leg1(89,89,89) #leftside
     leg2(89,89,89)
-    time.sleep(0.2)
-    leg3(89,89,89)
-    time.sleep(0.2)
+
+    leg3(89,89,89)#rightside
     leg4(89,89,89)
+
     time.sleep(2)
 
-    print("Moving to stance position...")
-    leg1(front_parallel,footdown,pincer_down)
-    time.sleep(0.2)
+    leg1(front_parallel,footdown,pincer_down) #leftside
     leg2(back_parallel,footdown,pincer_down)
-    time.sleep(0.2)
-    leg3(back_lateral,footdown,pincer_down)
-    time.sleep(0.2)
+
+    leg3(back_lateral,footdown,pincer_down)#rightside
     leg4(front_lateral,footdown,pincer_down)
 
     leg_formation = 1
