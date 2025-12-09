@@ -24,21 +24,21 @@ def main():
     try:
         while time.time() - start_time < 5:
             frame = picam2.capture_array()
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            # Picamera2 gives RGB, OpenCV displays BGR - no conversion needed for display
             
             frame_count += 1
             elapsed = time.time() - start_time
             fps = frame_count / elapsed if elapsed > 0 else 0
             
             # Add FPS and frame info to the image
-            cv2.putText(frame_bgr, f"FPS: {fps:.2f}", (10, 30), 
+            cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame_bgr, f"Frame: {frame_count}", (10, 70), 
+            cv2.putText(frame, f"Frame: {frame_count}", (10, 70), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame_bgr, f"Time: {elapsed:.1f}s / 5s", (10, 110), 
+            cv2.putText(frame, f"Time: {elapsed:.1f}s / 5s", (10, 110), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             
-            cv2.imshow("Pi Camera Test", frame_bgr)
+            cv2.imshow("Pi Camera Test", frame)
             
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
