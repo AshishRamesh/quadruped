@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
-Teleoperation script for quadruped robot
-Use arrow keys to control robot movement:
-- UP: Move forward
-- DOWN: Move backward
-- LEFT: Turn left
-- RIGHT: Turn right
-- SPACE: Stop
-- ESC or 'q': Quit
+Robust teleoperation script for quadruped robot with timeout protection
+Use arrow keys to control robot movement
 """
 
 from __future__ import division
@@ -15,9 +9,13 @@ import time
 import sys
 import tty
 import termios
+import signal
 import RPi.GPIO as GPIO
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 from adafruit_servokit import ServoKit
+
+# Global shutdown event for clean exit
+shutdown_event = Event()
 
 cur_angle_mutex = Lock()
 i2c_mutex = Lock()
@@ -41,18 +39,16 @@ GPIO.setup(leg3_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 GPIO.setup(leg4_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 # Initialize ServoKit for 16 channels
+print("Initializing ServoKit...", flush=True)
 kit = ServoKit(channels=16)
 
-# Set actuation range for all servos (0-180 degrees) - done lazily
-# We'll set this in begin() to avoid freezing on startup
+# Set actuation range
+for i in range(16):
+    kit.servo[i].actuation_range = 180
 
-# FIXED: Increased delays to prevent Pi freeze
-move_delay = 0.01  # Changed from 0.0005 to 0.01 (10ms)
-step_delay = 0.05  # Changed from 0.001 to 0.05 (50ms)
-i2c_delay = 0.002  # New: delay after each I2C write
-
-# Servo step size - move multiple degrees at once to reduce I2C traffic
-servo_step = 2  # Changed from 1 to 2 degrees per update
+# Updated delays from quadbot_gaits_robust.py
+move_delay = 0.0005
+step_delay = 0.001
 
 leg1_offset = [0,0,0]
 leg2_offset = [0,10,0]
@@ -73,15 +69,65 @@ footdown = 60
 pincer_up = 130
 pincer_down = 120
 
-leg1_footdown = footdown
-leg2_footdown = footdown
-leg3_footdown = footdown
-leg4_footdown = footdown
-
 leg_formation = 0
 servos_configured = False
 
-channel_cur = [90,90,90,90,90,90,90,90,90,90,90,90]
+channel_cur = [90]*12
+
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print("\n\n🛑 Interrupt received! Shutting down...", flush=True)
+    shutdown_event.set()
+    try:
+        for i in range(12):
+            setServo_safe(i, 90)
+    except:
+        pass
+    GPIO.cleanup()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
+def clamp_angle(angle):
+    """Ensure angle is within valid servo range"""
+    return max(0, min(180, int(angle)))
+
+
+def setServo_safe(channel, angle):
+    """Set servo with error handling and bounds checking"""
+    if shutdown_event.is_set():
+        return False
+    
+    angle = clamp_angle(angle)
+    
+    with i2c_mutex:
+        try:
+            kit.servo[channel].angle = angle
+            return True
+        except Exception as e:
+            # print(f"Error setting servo {channel}: {e}", flush=True)
+            return False
+
+
+def setServo_invert_safe(channel, angle):
+    """Set inverted servo with error handling and bounds checking"""
+    if shutdown_event.is_set():
+        return False
+    
+    angle = clamp_angle(angle)
+    inverted_angle = 180 - angle
+    
+    with i2c_mutex:
+        try:
+            kit.servo[channel].angle = inverted_angle
+            return True
+        except Exception as e:
+            # print(f"Error setting servo {channel}: {e}", flush=True)
+            return False
+
 
 def getch():
     """Get a single character from stdin without echo"""
@@ -94,363 +140,375 @@ def getch():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     return ch
 
+
 def print_controls():
     """Print control instructions"""
-    print("\n" + "="*50)
-    print("QUADRUPED TELEOPERATION CONTROLS")
-    print("="*50)
-    print("  ↑ (UP)    : Move Forward")
-    print("  ↓ (DOWN)  : Move Backward")
-    print("  ← (LEFT)  : Turn Left")
-    print("  → (RIGHT) : Turn Right")
-    print("  SPACE     : Stop/Rest position")
-    print("  ESC or q  : Quit")
-    print("="*50)
-    print("\nInitializing robot...\n")
+    print("\n" + "="*50, flush=True)
+    print("🤖 QUADRUPED TELEOPERATION - ROBUST VERSION", flush=True)
+    print("="*50, flush=True)
+    print("  ↑ (UP)    : Move Forward", flush=True)
+    print("  ↓ (DOWN)  : Move Backward", flush=True)
+    print("  ← (LEFT)  : Turn Left", flush=True)
+    print("  → (RIGHT) : Turn Right", flush=True)
+    print("  SPACE     : Stop/Rest position", flush=True)
+    print("  ESC or q  : Quit", flush=True)
+    print("="*50, flush=True)
+    print("\nInitializing robot...\n", flush=True)
 
-def main():
-    global leg_formation
-    
-    print_controls()
-    begin()
-    print("Robot ready! Use arrow keys to control.\n")
-    
-    try:
-        while True:
-            key = getch()
-            
-            # Check for arrow keys (escape sequences)
-            if key == '\x1b':  # ESC sequence
-                next1 = getch()
-                if next1 == '[':  # Arrow key sequence
-                    next2 = getch()
-                    if next2 == 'A':  # UP arrow
-                        print("→ Moving Forward")
-                        forward()
-                    elif next2 == 'B':  # DOWN arrow
-                        print("→ Moving Backward")
-                        backward()
-                    elif next2 == 'D':  # LEFT arrow
-                        print("→ Turning Left")
-                        turn_left()
-                    elif next2 == 'C':  # RIGHT arrow
-                        print("→ Turning Right")
-                        turn_right()
-                else:  # ESC key alone
-                    print("\nExiting...")
-                    break
-            
-            elif key == ' ':  # SPACE - return to rest position
-                print("→ Stopping - Rest position")
-                begin()
-            
-            elif key == 'q' or key == 'Q':  # Quit
-                print("\nExiting...")
-                break
-            
-            elif key == '\x03':  # Ctrl+C
-                print("\nInterrupted by user")
-                break
-    
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    
-    finally:
-        print("Shutting down robot...")
-        # Return to neutral position
-        for i in range(12):
-            channel_cur[i] = 90
-        GPIO.cleanup()
-        print("Goodbye!")
-    
+
+# Updated Leg Functions from quadbot_gaits_robust.py
+# Added shutdown_event check inside the loop
+
+def leg1(angle1, angle2, angle3):
+    angle1 = angle1 + leg1_offset[0]
+    angle2 = angle2 + leg1_offset[1]
+    angle3 = angle3 + leg1_offset[2]
+
+    while(channel_cur[0] != angle1 or channel_cur[1] != angle2 or channel_cur[2] != angle3 ):
+        if shutdown_event.is_set(): break
+
+        ##ANGLE1
+        if angle1 > channel_cur[0]:
+            channel_cur[0] += 1
+            setServo_invert_safe(0, channel_cur[0])
+        elif angle1 < channel_cur[0]:
+            channel_cur[0] -= 1
+            setServo_invert_safe(0, channel_cur[0])
+
+        ##ANGLE2
+        if angle2 > channel_cur[1]:
+            channel_cur[1] += 1
+            setServo_invert_safe(1, channel_cur[1])
+        elif angle2 < channel_cur[1]:
+            channel_cur[1] -= 1
+            setServo_invert_safe(1, channel_cur[1])
+
+        ##ANGLE3
+        if angle3 > channel_cur[2]:
+            channel_cur[2] += 1
+            setServo_safe(2, channel_cur[2])
+        elif angle3 < channel_cur[2]:
+            channel_cur[2] -= 1
+            setServo_safe(2, channel_cur[2])
+
+        time.sleep(move_delay)
+
+
+def leg2(angle1, angle2, angle3):
+    angle1 = angle1 + leg2_offset[0]
+    angle2 = angle2 + leg2_offset[1]
+    angle3 = angle3 + leg2_offset[2]
+
+    while(channel_cur[3] != angle1 or channel_cur[4] != angle2 or channel_cur[5] != angle3 ):
+        if shutdown_event.is_set(): break
+
+        if angle1 > channel_cur[3]:
+            channel_cur[3] += 1
+            setServo_invert_safe(3, channel_cur[3])
+        elif angle1 < channel_cur[3]:
+            channel_cur[3] -= 1
+            setServo_invert_safe(3, channel_cur[3])
+
+        if angle2 > channel_cur[4]:
+            channel_cur[4] += 1
+            setServo_invert_safe(4, channel_cur[4])
+        elif angle2 < channel_cur[4]:
+            channel_cur[4] -= 1
+            setServo_invert_safe(4, channel_cur[4])
+
+        if angle3 > channel_cur[5]:
+            channel_cur[5] += 1
+            setServo_safe(5, channel_cur[5])
+        elif angle3 < channel_cur[5]:
+            channel_cur[5] -= 1
+            setServo_safe(5, channel_cur[5])
+
+        time.sleep(move_delay)
+
+
+def leg3(angle1, angle2, angle3):
+    angle1 = angle1 + leg3_offset[0]
+    angle2 = angle2 + leg3_offset[1]
+    angle3 = angle3 + leg3_offset[2]
+
+    while(channel_cur[6] != angle1 or channel_cur[7] != angle2 or channel_cur[8] != angle3 ):
+        if shutdown_event.is_set(): break
+
+        if angle1 > channel_cur[6]:
+            channel_cur[6] += 1
+            setServo_safe(6, channel_cur[6])
+        elif angle1 < channel_cur[6]:
+            channel_cur[6] -= 1
+            setServo_safe(6, channel_cur[6])
+
+        if angle2 > channel_cur[7]:
+            channel_cur[7] += 1
+            setServo_invert_safe(7, channel_cur[7])
+        elif angle2 < channel_cur[7]:
+            channel_cur[7] -= 1
+            setServo_invert_safe(7, channel_cur[7])
+
+        if angle3 > channel_cur[8]:
+            channel_cur[8] += 1
+            setServo_safe(8, channel_cur[8])
+        elif angle3 < channel_cur[8]:
+            channel_cur[8] -= 1
+            setServo_safe(8, channel_cur[8])
+
+        time.sleep(move_delay)
+
+
+def leg4(angle1, angle2, angle3):
+    angle1 = angle1 + leg4_offset[0]
+    angle2 = angle2 + leg4_offset[1]
+    angle3 = angle3 + leg4_offset[2]
+
+    while(channel_cur[9] != angle1 or channel_cur[10] != angle2 or channel_cur[11] != angle3 ):
+        if shutdown_event.is_set(): break
+
+        if angle1 > channel_cur[9]:
+            channel_cur[9] += 1
+            setServo_safe(9, channel_cur[9])
+        elif angle1 < channel_cur[9]:
+            channel_cur[9] -= 1
+            setServo_safe(9, channel_cur[9])
+
+        if angle2 > channel_cur[10]:
+            channel_cur[10] += 1
+            setServo_invert_safe(10, channel_cur[10])
+        elif angle2 < channel_cur[10]:
+            channel_cur[10] -= 1
+            setServo_invert_safe(10, channel_cur[10])
+
+        if angle3 > channel_cur[11]:
+            channel_cur[11] += 1
+            setServo_safe(11, channel_cur[11])
+        elif angle3 < channel_cur[11]:
+            channel_cur[11] -= 1
+            setServo_safe(11, channel_cur[11])
+
+        time.sleep(move_delay)
+
 
 def begin():
-    global leg_formation, servos_configured
+    global leg_formation
+    if shutdown_event.is_set(): return
+
+    print("Beginning stance...", flush=True)
     
-    # Set actuation range for servos (only once)
-    if not servos_configured:
-        print("Configuring servos...")
-        for i in range(12):  # Only configure servos we use (0-11)
-            kit.servo[i].actuation_range = 180
-            time.sleep(0.05)  # Delay between each servo config
-        servos_configured = True
-    
-    print("Moving to initial position...")
-    # Move legs one at a time to avoid I2C bus overload
+    # Move Left Side
     leg1(89,89,89)
-    time.sleep(0.2)
     leg2(89,89,89)
-    time.sleep(0.2)
+
     leg3(89,89,89)
-    time.sleep(0.2)
     leg4(89,89,89)
+
     time.sleep(2)
 
-    print("Moving to stance position...")
     leg1(front_parallel,footdown,pincer_down)
-    time.sleep(0.2)
     leg2(back_parallel,footdown,pincer_down)
-    time.sleep(0.2)
+
     leg3(back_lateral,footdown,pincer_down)
-    time.sleep(0.2)
     leg4(front_lateral,footdown,pincer_down)
 
     leg_formation = 1
-    
+    print("Ready.", flush=True)
+
+
+# Updated Gait Functions with Reduced Concurrency (Max 2 threads)
 
 def forward():
     global leg_formation
+    if shutdown_event.is_set(): return
+
     if(leg_formation == 1):
-        #we always lift the leg in a parallel side. Assuming forward is called after begin(), which makes the left side legs parallel and right side legs lateral
-        #lift leg1
+        # lift leg1
         leg1(front_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg1 to lateral position
         leg1(front_lateral,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg1 down 
         leg1(front_lateral,footdown,pincer_down)
         time.sleep(step_delay)
 
-        #send leg2 to lateral, and leg4 to parallel, keep leg3 in lateral
+        # REDUCED CONCURRENCY
         t2 = Thread(target=leg2, args=(back_lateral,footdown,pincer_down))
         t3 = Thread(target=leg3, args=(back_lateral+back_lateral_add,footdown,pincer_down))
-        t4 = Thread(target=leg4, args=(front_parallel,footdown,pincer_down))
-
+        
         t2.start()
         t3.start()
-        t4.start()
-
         t2.join()
         t3.join()
-        t4.join()
-  
+        
+        leg4(front_parallel,footdown,pincer_down)
 
-        #lift leg3 and bring to parallel position
-
-        #lift
+        # lift leg3
         leg3(back_lateral+back_lateral_add,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg3 to parallel position
         leg3(back_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg3 down
         leg3(back_parallel,footdown,pincer_down)
         time.sleep(step_delay)
 
-        #now right side legs are parallel and left side legs are lateral
-
-        
-
     if (leg_formation == 2):
-        #lift leg4
+        # lift leg4
         leg4(front_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg4 to lateral position
         leg4(front_lateral,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg4 down
         leg4(front_lateral,footdown,pincer_down)
         time.sleep(step_delay)
 
-        # sending leg3 to lateral, and leg1 to parallel
+        # REDUCED CONCURRENCY
         t3 = Thread(target=leg3, args=(back_lateral,footdown,pincer_down))
         t2 = Thread(target=leg2, args=(back_lateral+back_lateral_add,footdown,pincer_down))
-        t1 = Thread(target=leg1, args=(front_parallel,footdown,pincer_down))
+        
         t3.start()
         t2.start()
-        t1.start()
-        
         t3.join()
         t2.join()
-        t1.join()
+        
+        leg1(front_parallel,footdown,pincer_down)
+        
         time.sleep(step_delay)
 
-        #lift leg2 and bring to parallel position
+        # lift leg2
         leg2(back_lateral+back_lateral_add,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg2 to lateral position
         leg2(back_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg2 down
         leg2(back_parallel,footdown,pincer_down)
         time.sleep(step_delay)
 
-        #now left side legs are parallel and right side legs are lateral
-
-
     if(leg_formation == 1):
         leg_formation = 2
     elif(leg_formation == 2):
         leg_formation = 1
+
 
 def backward():
     global leg_formation
+    if shutdown_event.is_set(): return
+
     if(leg_formation == 1):
-        #we always lift the leg in a parallel side. Assuming forward is called after begin(), which makes the left side legs parallel and right side legs lateral
-        #lift leg2
         leg2(back_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg2 to lateral position
         leg2(back_lateral,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg2 down 
         leg2(back_lateral,footdown,pincer_down)
         time.sleep(step_delay)
 
-        #send leg1 to lateral, and leg3 to parallel,
+        # REDUCED CONCURRENCY
         t1 = Thread(target=leg1, args=(front_lateral,footdown,pincer_down))
         t3 = Thread(target=leg3, args=(back_parallel,footdown,pincer_down))
-        t4 = Thread(target=leg4, args=(front_lateral+front_lateral_add,footdown,pincer_down))
-
+        
         t1.start()
         t3.start()
-        t4.start()
-
         t1.join()
         t3.join()
-        t4.join()
-  
+        
+        leg4(front_lateral+front_lateral_add,footdown,pincer_down)
 
-        #lift leg4 and bring to parallel position
-
-        #lift
+        # lift leg4
         leg4(front_lateral+front_lateral_add,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg3 to parallel position
         leg4(front_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg3 down
         leg4(front_parallel,footdown,pincer_down)
         time.sleep(step_delay)
 
-        #now right side legs are parallel and left side legs are lateral
-
-        
-
     if (leg_formation == 2):
-        #lift leg3
         leg3(back_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg3 to lateral position
         leg3(back_lateral,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg4 down
         leg3(back_lateral,footdown,pincer_down)
         time.sleep(step_delay)
 
-        
+        # REDUCED CONCURRENCY
         t4 = Thread(target=leg4, args=(front_lateral,footdown,pincer_down))
         t2 = Thread(target=leg2, args=(back_parallel,footdown,pincer_down))
-        t1 = Thread(target=leg1, args=(front_lateral+front_lateral_add,footdown,pincer_down))
+        
         t4.start()
         t2.start()
-        t1.start()
-        
         t4.join()
         t2.join()
-        t1.join()
+        
+        leg1(front_lateral+front_lateral_add,footdown,pincer_down)
+
         time.sleep(step_delay)
 
-        #lift leg1 and bring to parallel position
         leg1(front_lateral+front_lateral_add,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg1 to lateral position
         leg1(front_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg1 down
         leg1(front_parallel,footdown,pincer_down)
         time.sleep(step_delay)
-
-        #now left side legs are parallel and right side legs are lateral
-
 
     if(leg_formation == 1):
         leg_formation = 2
     elif(leg_formation == 2):
         leg_formation = 1
 
+
 def turn_left():
     global leg_formation
+    if shutdown_event.is_set(): return
+
     if(leg_formation == 1):
-        #we always lift the leg in a parallel side. Assuming forward is called after begin(), which makes the left side legs parallel and right side legs lateral
-        #lift leg1
         leg2(back_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg1 to lateral position
         leg2(back_lateral,footup,pincer_up)
         time.sleep(step_delay)
 
-        #send leg2 to lateral, and leg4 to parallel, keep leg3 in lateral
+        # REDUCED CONCURRENCY
         t1 = Thread(target=leg1, args=(front_lateral,footdown,pincer_down))
         t3 = Thread(target=leg3, args=(back_lateral+back_lateral_add,footdown,pincer_down))
-        t4 = Thread(target=leg4, args=(front_parallel,footdown,pincer_down))
-
+        
         t1.start()
         t3.start()
-        t4.start()
+        t1.join()
+        t3.join()
+        
+        leg4(front_parallel,footdown,pincer_down)
 
-        #bring leg1 down
         leg2(back_lateral,footdown,pincer_down)
         time.sleep(step_delay)
 
-        t1.join()
-        t3.join()
-        t4.join()
-
-
-        #lift leg3 and bring to parallel position
-
-        #lift
+        # lift leg3
         leg3(back_lateral+back_lateral_add,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg3 to parallel position
         leg3(back_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg3 down
         leg3(back_parallel,footdown,pincer_down)
         time.sleep(step_delay)
 
-        #now right side legs are parallel and left side legs are lateral
-
-        
-
     if (leg_formation == 2):
-        #lift leg4
         leg4(front_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg4 to lateral position
         leg4(front_lateral,footup,pincer_up)
         time.sleep(step_delay)
 
-        # sending leg3 to lateral, and leg1 to parallel
+        # REDUCED CONCURRENCY
         t3 = Thread(target=leg3, args=(back_lateral,footdown,pincer_down))
         t2 = Thread(target=leg2, args=(back_parallel,footdown,pincer_down))
-        t1 = Thread(target=leg1, args=(front_lateral+front_lateral_add,footdown,pincer_down))
+        
         t3.start()
         t2.start()
-        t1.start() 
-
-        #bring leg4 down
-        leg4(front_lateral,footdown,pincer_down)
-
         t3.join()
         t2.join()
-        t1.join()
+        
+        leg1(front_lateral+front_lateral_add,footdown,pincer_down)
+
+        leg4(front_lateral,footdown,pincer_down)
+
         time.sleep(step_delay)
 
-        #lift leg1 
         leg1(front_lateral+front_lateral_add,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg1 to prallel position
         leg1(front_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg1 down
         leg1(front_parallel,footdown,pincer_down)
         time.sleep(step_delay)
-
-        #now left side legs are parallel and right side legs are lateral
-
 
     if(leg_formation == 1):
         leg_formation = 2
@@ -460,85 +518,63 @@ def turn_left():
 
 def turn_right():
     global leg_formation
+    if shutdown_event.is_set(): return
+
     if(leg_formation == 1):
-        #we always lift the leg in a parallel side. Assuming forward is called after begin(), which makes the left side legs parallel and right side legs lateral
-        #lift leg1
         leg1(front_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg1 to lateral position
         leg1(front_lateral,footup,pincer_up)
         time.sleep(step_delay)
 
-        #send leg2 to lateral, and leg4 to lateral+, and leg3 parallel
+        # REDUCED CONCURRENCY
         t2 = Thread(target=leg2, args=(back_lateral,footdown,pincer_down))
         t3 = Thread(target=leg3, args=(back_parallel,footdown,pincer_down))
-        t4 = Thread(target=leg4, args=(front_lateral+front_lateral_add,footdown,pincer_down))
-
+        
         t2.start()
         t3.start()
-        t4.start()
+        t2.join()
+        t3.join()
 
-        #bring leg1 down
+        leg4(front_lateral+front_lateral_add,footdown,pincer_down)
+
         leg1(front_lateral,footdown,pincer_down)
         time.sleep(step_delay)
 
-        t2.join()
-        t3.join()
-        t4.join()
-
-
-        #lift leg4 and bring to parallel position
-
-        #lift leg 4
+        # lift leg 4
         leg4(front_lateral+front_lateral_add,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg4 to parallel position
         leg4(front_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg4 down
         leg4(front_parallel,footdown,pincer_down)
         time.sleep(step_delay)
 
-        #now right side legs are parallel and left side legs are lateral
-
-        
-
     if (leg_formation == 2):
-        #lift leg3
         leg3(back_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg4 to lateral position
         leg3(back_lateral,footup,pincer_up)
         time.sleep(step_delay)
 
-        # sending leg1 to lateral, and leg4 to lateral and leg2 to lateral+
+        # REDUCED CONCURRENCY
         t1 = Thread(target=leg1, args=(front_parallel,footdown,pincer_down))
         t4 = Thread(target=leg4, args=(front_lateral,footdown,pincer_down))
-        t2 = Thread(target=leg2, args=(back_lateral+back_lateral_add,footdown,pincer_down))
+        
         t1.start()
         t4.start()
-        t2.start() 
-
-        #bring leg3 down
-        leg3(back_lateral,footdown,pincer_down)
-
         t1.join()
         t4.join()
-        t2.join()
+        
+        leg2(back_lateral+back_lateral_add,footdown,pincer_down)
+
+        leg3(back_lateral,footdown,pincer_down)
+
         time.sleep(step_delay)
 
-        #lift leg2
         leg2(back_lateral+back_lateral_add,footup,pincer_up)
         time.sleep(step_delay)
-        #move leg1 to prallel position
         leg2(back_parallel,footup,pincer_up)
         time.sleep(step_delay)
-        #bring leg1 down
         leg2(back_parallel,footdown,pincer_down)
         time.sleep(step_delay)
-
-        #now left side legs are parallel and right side legs are lateral
-
 
     if(leg_formation == 1):
         leg_formation = 2
@@ -546,170 +582,61 @@ def turn_right():
         leg_formation = 1
 
 
-def setServo(channel, angle):
-    if angle < 0:
-        angle = 0
-    elif angle > 180:
-        angle = 180
+def main():
+    global leg_formation
     
-    i2c_mutex.acquire()
+    print_controls()
+    begin()
+    print("✅ Robot ready! Use arrow keys to control.\n", flush=True)
+    
     try:
-        kit.servo[channel].angle = angle
-        time.sleep(i2c_delay)  # FIXED: Add delay after I2C write
+        while not shutdown_event.is_set():
+            key = getch()
+            
+            if key == '\x1b':  # ESC sequence
+                next1 = getch()
+                if next1 == '[':  # Arrow key sequence
+                    next2 = getch()
+                    if next2 == 'A':  # UP arrow
+                        print("→ Moving Forward", flush=True)
+                        forward()
+                    elif next2 == 'B':  # DOWN arrow
+                        print("→ Moving Backward", flush=True)
+                        backward()
+                    elif next2 == 'D':  # LEFT arrow
+                        print("→ Turning Left", flush=True)
+                        turn_left()
+                    elif next2 == 'C':  # RIGHT arrow
+                        print("→ Turning Right", flush=True)
+                        turn_right()
+                else:  # ESC key alone
+                    print("\nExiting...", flush=True)
+                    break
+            
+            elif key == ' ':  # SPACE
+                print("→ Stopping - Rest position", flush=True)
+                begin()
+            
+            elif key == 'q' or key == 'Q':
+                print("\nExiting...", flush=True)
+                break
+            
+            elif key == '\x03':  # Ctrl+C
+                break
+    
+    except KeyboardInterrupt:
+        pass
+    
     finally:
-        i2c_mutex.release()
+        print("\n🛑 Shutting down robot...", flush=True)
+        try:
+            for i in range(12):
+                setServo_safe(i, 90)
+        except:
+            pass
+        GPIO.cleanup()
+        print("👋 Goodbye!", flush=True)
 
-def setServo_invert(channel, angle):
-    if angle < 0:
-        angle = 0
-    elif angle > 180:
-        angle = 180
-
-    i2c_mutex.acquire()
-    try:
-        # Invert the angle: 0° becomes 180°, 180° becomes 0°
-        kit.servo[channel].angle = 180 - angle
-        time.sleep(i2c_delay)  # FIXED: Add delay after I2C write
-    finally:
-        i2c_mutex.release()
-
-    
-
-    
-
-
-def leg1(angle1,angle2,angle3):
-    angle1 = angle1+leg1_offset[0]
-    angle2 = angle2+leg1_offset[1]
-    angle3 = angle3+leg1_offset[2]
-
-    while(channel_cur[0] != angle1 or channel_cur[1] != angle2 or channel_cur[2] != angle3 ):
-        ##ANGLE1
-        if angle1 > channel_cur[0]:
-            channel_cur[0] = min(channel_cur[0] + servo_step, angle1)  # FIXED: Move multiple degrees
-            setServo_invert(0,channel_cur[0])
-        elif angle1 < channel_cur[0]:
-            channel_cur[0] = max(channel_cur[0] - servo_step, angle1)  # FIXED: Move multiple degrees
-            setServo_invert(0,channel_cur[0])
-
-        ##ANGLE2
-        if angle2 > channel_cur[1]:
-            channel_cur[1] = min(channel_cur[1] + servo_step, angle2)  # FIXED: Move multiple degrees
-            setServo_invert(1,channel_cur[1])
-        elif angle2 < channel_cur[1]:
-            channel_cur[1] = max(channel_cur[1] - servo_step, angle2)  # FIXED: Move multiple degrees
-            setServo_invert(1,channel_cur[1])
-
-        ##ANGLE3
-        if angle3 > channel_cur[2]:
-            channel_cur[2] = min(channel_cur[2] + servo_step, angle3)  # FIXED: Move multiple degrees
-            setServo(2,channel_cur[2])
-        elif angle3 < channel_cur[2]:
-            channel_cur[2] = max(channel_cur[2] - servo_step, angle3)  # FIXED: Move multiple degrees
-            setServo(2,channel_cur[2])
-
-        time.sleep(move_delay)
-
-
-        
-
-def leg2(angle1,angle2,angle3):
-    angle1 = angle1+leg2_offset[0]
-    angle2 = angle2+leg2_offset[1]
-    angle3 = angle3+leg2_offset[2]
-
-    while(channel_cur[3] != angle1 or channel_cur[4] != angle2 or channel_cur[5] != angle3 ):
-    ##ANGLE1
-        if angle1 > channel_cur[3]:
-            channel_cur[3] = min(channel_cur[3] + servo_step, angle1)  # FIXED: Move multiple degrees
-            setServo_invert(3,channel_cur[3])
-        elif angle1 < channel_cur[3]:
-            channel_cur[3] = max(channel_cur[3] - servo_step, angle1)  # FIXED: Move multiple degrees
-            setServo_invert(3,channel_cur[3])
-
-        ##ANGLE2
-        if angle2 > channel_cur[4]:
-            channel_cur[4] = min(channel_cur[4] + servo_step, angle2)  # FIXED: Move multiple degrees
-            setServo_invert(4,channel_cur[4])
-        elif angle2 < channel_cur[4]:
-            channel_cur[4] = max(channel_cur[4] - servo_step, angle2)  # FIXED: Move multiple degrees
-            setServo_invert(4,channel_cur[4])
-
-        ##ANGLE3
-        if angle3 > channel_cur[5]:
-            channel_cur[5] = min(channel_cur[5] + servo_step, angle3)  # FIXED: Move multiple degrees
-            setServo(5,channel_cur[5])
-        elif angle3 < channel_cur[5]:
-            channel_cur[5] = max(channel_cur[5] - servo_step, angle3)  # FIXED: Move multiple degrees
-            setServo(5,channel_cur[5])
-
-        time.sleep(move_delay)
-
-    
-
-def leg3(angle1,angle2,angle3):
-    angle1 = angle1+leg3_offset[0]
-    angle2 = angle2+leg3_offset[1]
-    angle3 = angle3+leg3_offset[2]
-
-    while(channel_cur[6] != angle1 or channel_cur[7] != angle2 or channel_cur[8] != angle3 ):
-    ##ANGLE1
-        if angle1 > channel_cur[6]:
-            channel_cur[6] = min(channel_cur[6] + servo_step, angle1)  # FIXED: Move multiple degrees
-            setServo(6,channel_cur[6])
-        elif angle1 < channel_cur[6]:
-            channel_cur[6] = max(channel_cur[6] - servo_step, angle1)  # FIXED: Move multiple degrees
-            setServo(6,channel_cur[6])
-
-        ##ANGLE2
-        if angle2 > channel_cur[7]:
-            channel_cur[7] = min(channel_cur[7] + servo_step, angle2)  # FIXED: Move multiple degrees
-            setServo_invert(7,channel_cur[7])
-        elif angle2 < channel_cur[7]:
-            channel_cur[7] = max(channel_cur[7] - servo_step, angle2)  # FIXED: Move multiple degrees
-            setServo_invert(7,channel_cur[7])
-
-        ##ANGLE3
-        if angle3 > channel_cur[8]:
-            channel_cur[8] = min(channel_cur[8] + servo_step, angle3)  # FIXED: Move multiple degrees
-            setServo(8,channel_cur[8])
-        elif angle3 < channel_cur[8]:
-            channel_cur[8] = max(channel_cur[8] - servo_step, angle3)  # FIXED: Move multiple degrees
-            setServo(8,channel_cur[8])
-
-        time.sleep(move_delay)
-
-def leg4(angle1,angle2,angle3):
-    angle1 = angle1+leg4_offset[0]
-    angle2 = angle2+leg4_offset[1]
-    angle3 = angle3+leg4_offset[2]
-
-    while(channel_cur[9] != angle1 or channel_cur[10] != angle2 or channel_cur[11] != angle3 ):
-    ##ANGLE1
-        if angle1 > channel_cur[9]:
-            channel_cur[9] = min(channel_cur[9] + servo_step, angle1)  # FIXED: Move multiple degrees
-            setServo(9,channel_cur[9])
-        elif angle1 < channel_cur[9]:
-            channel_cur[9] = max(channel_cur[9] - servo_step, angle1)  # FIXED: Move multiple degrees
-            setServo(9,channel_cur[9])
-
-        ##ANGLE2
-        if angle2 > channel_cur[10]:
-            channel_cur[10] = min(channel_cur[10] + servo_step, angle2)  # FIXED: Move multiple degrees
-            setServo_invert(10,channel_cur[10])
-        elif angle2 < channel_cur[10]:
-            channel_cur[10] = max(channel_cur[10] - servo_step, angle2)  # FIXED: Move multiple degrees
-            setServo_invert(10,channel_cur[10])
-
-        ##ANGLE3
-        if angle3 > channel_cur[11]:
-            channel_cur[11] = min(channel_cur[11] + servo_step, angle3)  # FIXED: Move multiple degrees
-            setServo(11,channel_cur[11])
-        elif angle3 < channel_cur[11]:
-            channel_cur[11] = max(channel_cur[11] - servo_step, angle3)  # FIXED: Move multiple degrees
-            setServo(11,channel_cur[11])
-
-        time.sleep(move_delay)
 
 if __name__ == '__main__':
     main()
