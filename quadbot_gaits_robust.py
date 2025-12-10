@@ -106,6 +106,14 @@ def setServo_invert(channel, angle):
         set_servo_pulse(channel, pulse_len)
 
 def pinsetup():
+    # 'board' library may set GPIO mode to BCM. Reset to BOARD.
+    try:
+        if GPIO.getmode() is not None and GPIO.getmode() != GPIO.BOARD:
+            print(f"Resetting GPIO mode from {GPIO.getmode()} to BOARD")
+            GPIO.cleanup()
+    except Exception:
+        pass
+
     GPIO.setmode(GPIO.BOARD)
     GPIO.setup(leg1_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(leg2_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
