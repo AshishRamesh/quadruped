@@ -428,7 +428,7 @@ if __name__ == '__main__':
     picam2 = Picamera2()
     # config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
     # Correct config creation for headless
-    config = picam2.create_configuration(main={"size": (640, 480), "format": "RGB888"})
+    config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
     picam2.configure(config)
     picam2.start()
     
