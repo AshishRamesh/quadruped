@@ -36,15 +36,20 @@ pca.frequency = 60
 SERVO_MIN_PULSE = 500   # Minimum pulse width in microseconds
 SERVO_MAX_PULSE = 2500  # Maximum pulse width in microseconds
 
-# FIXED: Increased delays to prevent Pi freeze
-move_delay = 0.01  # Changed from 0.0005 to 0.01 (10ms)
-step_delay = 0.05  # Changed from 0.001 to 0.05 (50ms)
+# FIXED: VERY conservative delays to prevent Pi crash
+move_delay = 0.02   # Increased to 20ms (was 0.01)
+step_delay = 0.15   # Increased to 150ms (was 0.05)
+i2c_delay = 0.005   # Increased I2C delay to 5ms
 
-# Servo step size - move multiple degrees at once to reduce I2C traffic
-servo_step = 2  # Changed from 1 to 2 degrees per update
+# Servo step size - smaller steps for smoother movement
+servo_step = 1      # Back to 1 degree for safety (was 2)
 
 # Maximum iterations to prevent infinite loops
-MAX_ITERATIONS = 200
+MAX_ITERATIONS = 300  # Increased timeout
+
+# I2C retry settings
+I2C_MAX_RETRIES = 3
+I2C_RETRY_DELAY = 0.01
 
 leg1_offset = [0, 0, 0]
 leg2_offset = [0, 10, 0]
@@ -118,21 +123,27 @@ def angle_to_pulse_width(angle, channel):
     """
     Convert angle (0-180) to pulse width and set servo
     This matches the original PWM formula: pwm_value = (angle * 2.5) + 150
+    With retry logic for I2C errors
     """
     # Map 0-180 degrees to pulse width in microseconds
-    # Original formula: pwm = (angle * 2.5) + 150 (out of 4096 at 60Hz)
-    # Convert to microseconds: (pwm / 4096) * (1000000 / 60)
     pulse_range = SERVO_MAX_PULSE - SERVO_MIN_PULSE
     pulse_width = SERVO_MIN_PULSE + (angle / 180.0) * pulse_range
     
-    i2c_mutex.acquire()
-    try:
-        pca.channels[channel].duty_cycle = int((pulse_width / 1000000.0) * 65535 * pca.frequency)
-        time.sleep(0.002)  # Small delay after I2C write
-    except Exception as e:
-        print(f"⚠️  Error setting servo {channel}: {e}")
-    finally:
-        i2c_mutex.release()
+    for retry in range(I2C_MAX_RETRIES):
+        i2c_mutex.acquire()
+        try:
+            pca.channels[channel].duty_cycle = int((pulse_width / 1000000.0) * 65535 * pca.frequency)
+            time.sleep(i2c_delay)  # Increased delay after I2C write
+            i2c_mutex.release()
+            return True  # Success
+        except Exception as e:
+            i2c_mutex.release()
+            if retry < I2C_MAX_RETRIES - 1:
+                time.sleep(I2C_RETRY_DELAY)
+                continue
+            else:
+                print(f"⚠️  Error setting servo {channel} after {I2C_MAX_RETRIES} retries: {e}")
+                return False
 
 
 def setServo(channel, angle):
@@ -335,25 +346,25 @@ def begin():
     global leg_formation
     
     print("🤖 Moving to initial position...")
-    # Move legs one at a time to avoid overload
+    # Move legs one at a time with longer delays to avoid power issues
     leg1(89, 89, 89)
-    time.sleep(0.3)
+    time.sleep(0.5)  # Increased delay
     leg2(89, 89, 89)
-    time.sleep(0.3)
+    time.sleep(0.5)
     leg3(89, 89, 89)
-    time.sleep(0.3)
+    time.sleep(0.5)
     leg4(89, 89, 89)
-    time.sleep(1)
+    time.sleep(1.5)  # Longer settling time
     
     print("🤖 Moving to stance position...")
     leg1(front_parallel, footdown, pincer_down)
-    time.sleep(0.3)
-    leg2(back_parallel, footdown, pincer_down)
-    time.sleep(0.3)
-    leg3(back_lateral, footdown, pincer_down)
-    time.sleep(0.3)
-    leg4(front_lateral, footdown, pincer_down)
     time.sleep(0.5)
+    leg2(back_parallel, footdown, pincer_down)
+    time.sleep(0.5)
+    leg3(back_lateral, footdown, pincer_down)
+    time.sleep(0.5)
+    leg4(front_lateral, footdown, pincer_down)
+    time.sleep(1.0)  # Extra settling time
     
     leg_formation = 1
     print("✅ Robot ready!")
@@ -425,14 +436,32 @@ def turn_right():
     leg_formation = 2 if leg_formation == 1 else 1
 
 
+def get_cpu_temp():
+    """Get CPU temperature in Celsius"""
+    try:
+        with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+            temp = float(f.read()) / 1000.0
+            return temp
+    except:
+        return None
+
+
 def main():
     """Main program"""
     print("\n" + "="*60)
     print("🤖 QUADBOT GAIT CONTROL - CircuitPython PCA9685")
     print("="*60)
     print("Using modern adafruit-circuitpython-pca9685 library")
+    print("ULTRA-CONSERVATIVE MODE for Pi 3B+ stability")
     print("Press Ctrl+C to stop at any time")
     print("="*60 + "\n")
+    
+    # Check initial temperature
+    temp = get_cpu_temp()
+    if temp:
+        print(f"🌡️  CPU Temperature: {temp:.1f}°C")
+        if temp > 70:
+            print("⚠️  WARNING: CPU is hot! Ensure good cooling.")
     
     try:
         pinsetup()
@@ -442,15 +471,34 @@ def main():
         begin()
         time.sleep(1)
         
+        # Check temperature after initialization
+        temp = get_cpu_temp()
+        if temp:
+            print(f"🌡️  CPU Temperature after init: {temp:.1f}°C")
+        
         print("\n🎯 Executing 4 right turns...")
         for i in range(4):
             if shutdown_event.is_set():
                 break
             print(f"\nTurn {i+1}/4")
             turn_right()
-            time.sleep(0.5)
+            time.sleep(1.0)  # Longer delay between turns
+            
+            # Monitor temperature
+            temp = get_cpu_temp()
+            if temp:
+                if temp > 75:
+                    print(f"⚠️  CPU HOT: {temp:.1f}°C - Adding cooling delay...")
+                    time.sleep(2.0)
+                elif temp > 70:
+                    print(f"⚠️  CPU Warm: {temp:.1f}°C")
         
         print("\n✅ Program completed successfully!")
+        
+        # Final temperature
+        temp = get_cpu_temp()
+        if temp:
+            print(f"🌡️  Final CPU Temperature: {temp:.1f}°C")
         
     except Exception as e:
         print(f"\n❌ Error: {e}")
@@ -461,7 +509,7 @@ def main():
         for i in range(12):
             try:
                 angle_to_pulse_width(90, i)
-                time.sleep(0.01)
+                time.sleep(0.02)  # Slower return to neutral
             except:
                 pass
         pca.deinit()
