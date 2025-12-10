@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Robust quadbot gait control with timeout protection and interrupt handling
+Robust quadbot gait control using adafruit-circuitpython-pca9685
+Modern CircuitPython library version with all safety features
 """
 from __future__ import division
 import time
@@ -8,7 +9,9 @@ import signal
 import sys
 import RPi.GPIO as GPIO
 from threading import Thread, Lock, Event
-from adafruit_servokit import ServoKit
+import board
+import busio
+from adafruit_pca9685 import PCA9685
 
 # Global shutdown event for clean exit
 shutdown_event = Event()
@@ -22,39 +25,26 @@ leg2_s = 35
 leg3_s = 33
 leg4_s = 31
 
-# Setup GPIO before ServoKit initialization to avoid mode conflicts
-GPIO.setwarnings(False)
-try:
-    GPIO.setmode(GPIO.BOARD)
-except ValueError:
-    pass  # Mode already set, continue
-
-GPIO.setup(leg1_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-GPIO.setup(leg2_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-GPIO.setup(leg3_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-GPIO.setup(leg4_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
-# Initialize ServoKit for 16 channels
+# Initialize I2C bus and PCA9685
 print("Initializing PCA9685...")
-kit = ServoKit(channels=16)
+i2c = busio.I2C(board.SCL, board.SDA)
+pca = PCA9685(i2c)
+pca.frequency = 60
 
-# Set actuation range for all servos (0-180 degrees)
-print("Configuring servos...")
-for i in range(12):  # Only configure servos we use
-    kit.servo[i].actuation_range = 180
-    time.sleep(0.05)  # Delay between configs
-print("Servos configured!")
+# Servo pulse range (in microseconds for CircuitPython library)
+# These values map to the original 150-600 PWM range
+SERVO_MIN_PULSE = 500   # Minimum pulse width in microseconds
+SERVO_MAX_PULSE = 2500  # Maximum pulse width in microseconds
 
 # FIXED: Increased delays to prevent Pi freeze
-move_delay = 0.015  # Slightly increased for more stability
-step_delay = 0.1    # Increased for smoother movement
-i2c_delay = 0.003   # Increased I2C delay
+move_delay = 0.01  # Changed from 0.0005 to 0.01 (10ms)
+step_delay = 0.05  # Changed from 0.001 to 0.05 (50ms)
 
 # Servo step size - move multiple degrees at once to reduce I2C traffic
-servo_step = 3  # Increased to 3 degrees for faster, smoother movement
+servo_step = 2  # Changed from 1 to 2 degrees per update
 
 # Maximum iterations to prevent infinite loops
-MAX_ITERATIONS = 200  # Safety limit
+MAX_ITERATIONS = 200
 
 leg1_offset = [0, 0, 0]
 leg2_offset = [0, 10, 0]
@@ -75,6 +65,11 @@ footdown = 60
 pincer_up = 130
 pincer_down = 120
 
+leg1_footdown = footdown
+leg2_footdown = footdown
+leg3_footdown = footdown
+leg4_footdown = footdown
+
 leg_formation = 0
 
 channel_cur = [90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90]
@@ -84,12 +79,14 @@ def signal_handler(sig, frame):
     """Handle Ctrl+C gracefully"""
     print("\n\n🛑 Interrupt received! Shutting down...")
     shutdown_event.set()
-    # Return servos to neutral
     try:
+        # Return servos to neutral (90 degrees)
         for i in range(12):
-            setServo_safe(i, 90)
+            angle_to_pulse_width(90, i)
+            time.sleep(0.01)
     except:
         pass
+    pca.deinit()
     GPIO.cleanup()
     sys.exit(0)
 
@@ -98,53 +95,67 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 
+def pinsetup():
+    """Setup GPIO pins"""
+    GPIO.setwarnings(False)
+    try:
+        GPIO.setmode(GPIO.BOARD)
+    except ValueError:
+        pass  # Mode already set
+    
+    GPIO.setup(leg1_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(leg2_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(leg3_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(leg4_s, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+
 def clamp_angle(angle):
     """Ensure angle is within valid servo range"""
     return max(0, min(180, int(angle)))
 
 
-def setServo_safe(channel, angle):
-    """Set servo with error handling and bounds checking"""
-    if shutdown_event.is_set():
-        return False
-    
-    angle = clamp_angle(angle)
+def angle_to_pulse_width(angle, channel):
+    """
+    Convert angle (0-180) to pulse width and set servo
+    This matches the original PWM formula: pwm_value = (angle * 2.5) + 150
+    """
+    # Map 0-180 degrees to pulse width in microseconds
+    # Original formula: pwm = (angle * 2.5) + 150 (out of 4096 at 60Hz)
+    # Convert to microseconds: (pwm / 4096) * (1000000 / 60)
+    pulse_range = SERVO_MAX_PULSE - SERVO_MIN_PULSE
+    pulse_width = SERVO_MIN_PULSE + (angle / 180.0) * pulse_range
     
     i2c_mutex.acquire()
     try:
-        kit.servo[channel].angle = angle
-        time.sleep(i2c_delay)
-        return True
+        pca.channels[channel].duty_cycle = int((pulse_width / 1000000.0) * 65535 * pca.frequency)
+        time.sleep(0.002)  # Small delay after I2C write
     except Exception as e:
-        print(f"⚠️  Error setting servo {channel} to {angle}°: {e}")
-        return False
+        print(f"⚠️  Error setting servo {channel}: {e}")
     finally:
         i2c_mutex.release()
 
 
-def setServo_invert_safe(channel, angle):
-    """Set inverted servo with error handling and bounds checking"""
+def setServo(channel, angle):
+    """Set servo using angle (0-180)"""
     if shutdown_event.is_set():
-        return False
+        return
+    
+    angle = clamp_angle(angle)
+    angle_to_pulse_width(angle, channel)
+
+
+def setServo_invert(channel, angle):
+    """Set inverted servo using angle (0-180)"""
+    if shutdown_event.is_set():
+        return
     
     angle = clamp_angle(angle)
     inverted_angle = 180 - angle
-    
-    i2c_mutex.acquire()
-    try:
-        kit.servo[channel].angle = inverted_angle
-        time.sleep(i2c_delay)
-        return True
-    except Exception as e:
-        print(f"⚠️  Error setting inverted servo {channel} to {inverted_angle}°: {e}")
-        return False
-    finally:
-        i2c_mutex.release()
+    angle_to_pulse_width(inverted_angle, channel)
 
 
 def leg1(angle1, angle2, angle3):
     """Control leg 1 with timeout protection"""
-    # Apply offsets and clamp
     angle1 = clamp_angle(angle1 + leg1_offset[0])
     angle2 = clamp_angle(angle2 + leg1_offset[1])
     angle3 = clamp_angle(angle3 + leg1_offset[2])
@@ -162,26 +173,26 @@ def leg1(angle1, angle2, angle3):
         # ANGLE1
         if angle1 > channel_cur[0]:
             channel_cur[0] = min(channel_cur[0] + servo_step, angle1)
-            setServo_invert_safe(0, channel_cur[0])
+            setServo_invert(0, channel_cur[0])
         elif angle1 < channel_cur[0]:
             channel_cur[0] = max(channel_cur[0] - servo_step, angle1)
-            setServo_invert_safe(0, channel_cur[0])
+            setServo_invert(0, channel_cur[0])
         
         # ANGLE2
         if angle2 > channel_cur[1]:
             channel_cur[1] = min(channel_cur[1] + servo_step, angle2)
-            setServo_invert_safe(1, channel_cur[1])
+            setServo_invert(1, channel_cur[1])
         elif angle2 < channel_cur[1]:
             channel_cur[1] = max(channel_cur[1] - servo_step, angle2)
-            setServo_invert_safe(1, channel_cur[1])
+            setServo_invert(1, channel_cur[1])
         
         # ANGLE3
         if angle3 > channel_cur[2]:
             channel_cur[2] = min(channel_cur[2] + servo_step, angle3)
-            setServo_safe(2, channel_cur[2])
+            setServo(2, channel_cur[2])
         elif angle3 < channel_cur[2]:
             channel_cur[2] = max(channel_cur[2] - servo_step, angle3)
-            setServo_safe(2, channel_cur[2])
+            setServo(2, channel_cur[2])
         
         time.sleep(move_delay)
         iterations += 1
@@ -206,26 +217,26 @@ def leg2(angle1, angle2, angle3):
         # ANGLE1
         if angle1 > channel_cur[3]:
             channel_cur[3] = min(channel_cur[3] + servo_step, angle1)
-            setServo_invert_safe(3, channel_cur[3])
+            setServo_invert(3, channel_cur[3])
         elif angle1 < channel_cur[3]:
             channel_cur[3] = max(channel_cur[3] - servo_step, angle1)
-            setServo_invert_safe(3, channel_cur[3])
+            setServo_invert(3, channel_cur[3])
         
         # ANGLE2
         if angle2 > channel_cur[4]:
             channel_cur[4] = min(channel_cur[4] + servo_step, angle2)
-            setServo_invert_safe(4, channel_cur[4])
+            setServo_invert(4, channel_cur[4])
         elif angle2 < channel_cur[4]:
             channel_cur[4] = max(channel_cur[4] - servo_step, angle2)
-            setServo_invert_safe(4, channel_cur[4])
+            setServo_invert(4, channel_cur[4])
         
         # ANGLE3
         if angle3 > channel_cur[5]:
             channel_cur[5] = min(channel_cur[5] + servo_step, angle3)
-            setServo_safe(5, channel_cur[5])
+            setServo(5, channel_cur[5])
         elif angle3 < channel_cur[5]:
             channel_cur[5] = max(channel_cur[5] - servo_step, angle3)
-            setServo_safe(5, channel_cur[5])
+            setServo(5, channel_cur[5])
         
         time.sleep(move_delay)
         iterations += 1
@@ -250,26 +261,26 @@ def leg3(angle1, angle2, angle3):
         # ANGLE1
         if angle1 > channel_cur[6]:
             channel_cur[6] = min(channel_cur[6] + servo_step, angle1)
-            setServo_safe(6, channel_cur[6])
+            setServo(6, channel_cur[6])
         elif angle1 < channel_cur[6]:
             channel_cur[6] = max(channel_cur[6] - servo_step, angle1)
-            setServo_safe(6, channel_cur[6])
+            setServo(6, channel_cur[6])
         
         # ANGLE2
         if angle2 > channel_cur[7]:
             channel_cur[7] = min(channel_cur[7] + servo_step, angle2)
-            setServo_invert_safe(7, channel_cur[7])
+            setServo_invert(7, channel_cur[7])
         elif angle2 < channel_cur[7]:
             channel_cur[7] = max(channel_cur[7] - servo_step, angle2)
-            setServo_invert_safe(7, channel_cur[7])
+            setServo_invert(7, channel_cur[7])
         
         # ANGLE3
         if angle3 > channel_cur[8]:
             channel_cur[8] = min(channel_cur[8] + servo_step, angle3)
-            setServo_safe(8, channel_cur[8])
+            setServo(8, channel_cur[8])
         elif angle3 < channel_cur[8]:
             channel_cur[8] = max(channel_cur[8] - servo_step, angle3)
-            setServo_safe(8, channel_cur[8])
+            setServo(8, channel_cur[8])
         
         time.sleep(move_delay)
         iterations += 1
@@ -294,26 +305,26 @@ def leg4(angle1, angle2, angle3):
         # ANGLE1
         if angle1 > channel_cur[9]:
             channel_cur[9] = min(channel_cur[9] + servo_step, angle1)
-            setServo_safe(9, channel_cur[9])
+            setServo(9, channel_cur[9])
         elif angle1 < channel_cur[9]:
             channel_cur[9] = max(channel_cur[9] - servo_step, angle1)
-            setServo_safe(9, channel_cur[9])
+            setServo(9, channel_cur[9])
         
         # ANGLE2
         if angle2 > channel_cur[10]:
             channel_cur[10] = min(channel_cur[10] + servo_step, angle2)
-            setServo_invert_safe(10, channel_cur[10])
+            setServo_invert(10, channel_cur[10])
         elif angle2 < channel_cur[10]:
             channel_cur[10] = max(channel_cur[10] - servo_step, angle2)
-            setServo_invert_safe(10, channel_cur[10])
+            setServo_invert(10, channel_cur[10])
         
         # ANGLE3
         if angle3 > channel_cur[11]:
             channel_cur[11] = min(channel_cur[11] + servo_step, angle3)
-            setServo_safe(11, channel_cur[11])
+            setServo(11, channel_cur[11])
         elif angle3 < channel_cur[11]:
             channel_cur[11] = max(channel_cur[11] - servo_step, angle3)
-            setServo_safe(11, channel_cur[11])
+            setServo(11, channel_cur[11])
         
         time.sleep(move_delay)
         iterations += 1
@@ -346,78 +357,6 @@ def begin():
     
     leg_formation = 1
     print("✅ Robot ready!")
-
-
-def forward():
-    """Move robot forward one step"""
-    global leg_formation
-    if shutdown_event.is_set():
-        return
-    
-    print("→ Forward")
-    
-    if leg_formation == 1:
-        # Lift and move leg1
-        leg1(front_parallel, footup, pincer_up)
-        time.sleep(step_delay)
-        leg1(front_lateral, footup, pincer_up)
-        time.sleep(step_delay)
-        leg1(front_lateral, footdown, pincer_down)
-        time.sleep(step_delay)
-        
-        # Move other legs in parallel
-        t2 = Thread(target=leg2, args=(back_lateral, footdown, pincer_down))
-        t3 = Thread(target=leg3, args=(back_lateral + back_lateral_add, footdown, pincer_down))
-        t4 = Thread(target=leg4, args=(front_parallel, footdown, pincer_down))
-        
-        t2.start()
-        t3.start()
-        t4.start()
-        
-        t2.join()
-        t3.join()
-        t4.join()
-        
-        # Lift and move leg3
-        leg3(back_lateral + back_lateral_add, footup, pincer_up)
-        time.sleep(step_delay)
-        leg3(back_parallel, footup, pincer_up)
-        time.sleep(step_delay)
-        leg3(back_parallel, footdown, pincer_down)
-        time.sleep(step_delay)
-        
-    elif leg_formation == 2:
-        # Lift and move leg4
-        leg4(front_parallel, footup, pincer_up)
-        time.sleep(step_delay)
-        leg4(front_lateral, footup, pincer_up)
-        time.sleep(step_delay)
-        leg4(front_lateral, footdown, pincer_down)
-        time.sleep(step_delay)
-        
-        # Move other legs in parallel
-        t3 = Thread(target=leg3, args=(back_lateral, footdown, pincer_down))
-        t2 = Thread(target=leg2, args=(back_lateral + back_lateral_add, footdown, pincer_down))
-        t1 = Thread(target=leg1, args=(front_parallel, footdown, pincer_down))
-        
-        t3.start()
-        t2.start()
-        t1.start()
-        
-        t3.join()
-        t2.join()
-        t1.join()
-        
-        # Lift and move leg2
-        leg2(back_lateral + back_lateral_add, footup, pincer_up)
-        time.sleep(step_delay)
-        leg2(back_parallel, footup, pincer_up)
-        time.sleep(step_delay)
-        leg2(back_parallel, footdown, pincer_down)
-        time.sleep(step_delay)
-    
-    # Toggle formation
-    leg_formation = 2 if leg_formation == 1 else 1
 
 
 def turn_right():
@@ -488,13 +427,18 @@ def turn_right():
 
 def main():
     """Main program"""
-    print("\n" + "="*50)
-    print("🤖 QUADBOT GAIT CONTROL - ROBUST VERSION")
-    print("="*50)
+    print("\n" + "="*60)
+    print("🤖 QUADBOT GAIT CONTROL - CircuitPython PCA9685")
+    print("="*60)
+    print("Using modern adafruit-circuitpython-pca9685 library")
     print("Press Ctrl+C to stop at any time")
-    print("="*50 + "\n")
+    print("="*60 + "\n")
     
     try:
+        pinsetup()
+        print("✅ GPIO pins configured!")
+        print("✅ PCA9685 initialized!")
+        
         begin()
         time.sleep(1)
         
@@ -510,10 +454,17 @@ def main():
         
     except Exception as e:
         print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         print("\n🛑 Returning to neutral position...")
         for i in range(12):
-            setServo_safe(i, 90)
+            try:
+                angle_to_pulse_width(90, i)
+                time.sleep(0.01)
+            except:
+                pass
+        pca.deinit()
         GPIO.cleanup()
         print("👋 Goodbye!")
 

@@ -91,10 +91,6 @@ def capture_frames():
         # Add FPS and frame info
         cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(frame, f"Frame: {frame_count}", (10, 70), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(frame, f"Time: {elapsed:.1f}s", (10, 110), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         
         with frame_lock:
             latest_frame = frame
